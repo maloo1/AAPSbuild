@@ -1,8 +1,10 @@
 # Kickstart file for Rocky linux to build nightscout and nightscout reporter VM
 # Note: you will have to ensure you setup your network and update YOUR.DOMAIN.com below
-CHANGE THIS AS REQUIRED
+
+# CHANGE THIS AS REQUIRED
 # Network information
 network  --bootproto=static --gateway=X.X.X.X --ip=X.X.X.X --nameserver=X.X.X.X --netmask=255.255.255.0 --activate --hostname=cgm.YOUR.DOMAIN.com
+
 graphical
 keyboard --vckeymap=us --xlayouts='us'
 skipx
