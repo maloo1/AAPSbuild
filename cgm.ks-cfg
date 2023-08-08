@@ -1,0 +1,260 @@
+# Kickstart file for Rocky linux to build nightscout and nightscout reporter VM
+# Note: you will have to ensure you setup your network and update YOUR.DOMAIN.com below
+
+# CHANGE THIS AS REQUIRED
+# Network information
+network  --bootproto=static --gateway=X.X.X.X --ip=X.X.X.X --nameserver=X.X.X.X --netmask=255.255.255.0 --activate --hostname=cgm.YOUR.DOMAIN.com
+
+graphical
+keyboard --vckeymap=us --xlayouts='us'
+skipx
+reboot
+# Disk partitioning information
+ignoredisk --only-use=vda
+clearpart --none --initlabel
+part /boot --fstype="ext4" --ondisk=vda --size=750
+part pv.01 --fstype="lvmpv" --ondisk=vda --grow
+volgroup vg --pesize=4096 pv.01
+logvol swap --fstype="swap" --size=1024 --name=swap --vgname=vg
+#use XFS for mongodb
+logvol / --fstype="xfs" --size=1 --grow --name=root --vgname=vg
+
+# System services
+services --enabled chronyd,postfix,mongod,httpd
+
+#Firewall
+firewall --enabled --service=https --port=1337:tcp
+
+#Add repos
+repo --name=BaseOS --mirrorlist=https://mirrors.rockylinux.org/mirrorlist?arch=$basearch&repo=BaseOS-$releasever
+repo --name=AppStream --mirrorlist=https://mirrors.rockylinux.org/mirrorlist?arch=$basearch&repo=AppStream-$releasever
+repo --install --name=mongodb-org-4.4 --baseurl=https://repo.mongodb.org/yum/redhat/8/mongodb-org/4.4/x86_64/
+
+module --name=nodejs:12
+
+%packages
+@^minimal-environment
+kexec-tools
+
+#Generic packages
+bash-completion
+vim
+wget
+mailx
+postfix
+
+#Packages for nightscout
+git
+nodejs
+mongodb-org
+checkpolicy
+
+#Packages for nightscout reporter
+httpd
+mod_ssl
+php
+unzip
+
+#AD integration
+realmd
+oddjob
+oddjob-mkhomedir
+sssd
+adcli
+
+%end
+
+%post --log=/root/ks-post.log
+
+#Add gpg keys to mongodb repo
+echo 'gpgcheck=1' >> /etc/yum.repos.d/mongodb-org-4.4.repo
+echo 'gpgkey=https://www.mongodb.org/static/pgp/server-4.4.asc' >> /etc/yum.repos.d/mongodb-org-4.4.repo
+
+#Setup Mongodb
+#SElinux
+cat > mongodb_cgroup_memory.te <<EOF
+module mongodb_cgroup_memory 1.0;
+require {
+      type cgroup_t;
+      type mongod_t;
+      class dir search;
+      class file { getattr open read };
+}
+#============= mongod_t ==============
+allow mongod_t cgroup_t:dir search;
+allow mongod_t cgroup_t:file { getattr open read };
+EOF
+checkmodule -M -m -o mongodb_cgroup_memory.mod mongodb_cgroup_memory.te
+semodule_package -o mongodb_cgroup_memory.pp -m mongodb_cgroup_memory.mod
+semodule -i mongodb_cgroup_memory.pp
+
+cat > mongodb_proc_net.te <<EOF
+module mongodb_proc_net 1.0;
+require {
+    type proc_net_t;
+    type mongod_t;
+    class file { open read };
+}
+#============= mongod_t ==============
+allow mongod_t proc_net_t:file { open read };
+EOF
+checkmodule -M -m -o mongodb_proc_net.mod mongodb_proc_net.te
+semodule_package -o mongodb_proc_net.pp -m mongodb_proc_net.mod
+semodule -i mongodb_proc_net.pp
+
+cat > cgm.te <<EOF
+module cgm 1.0;
+
+require {
+        type init_t;
+        type mongod_t;
+        type user_home_t;
+        type sysctl_fs_t;
+        class dir search;
+        class file { open read };
+}
+
+#============= init_t ==============
+allow init_t user_home_t:file { open read };
+
+#============= mongod_t ==============
+allow mongod_t sysctl_fs_t:dir search;
+EOF
+checkmodule -M -m -o cgm.mod cgm.te
+semodule_package -o cgm.pp -m cgm.mod
+semodule -i cgm.pp
+
+systemctl start mongod
+mongo <<< 'db.disableFreeMonitoring()'
+
+
+#User to run nightscout
+adduser nightscout
+
+su - nightscout -c "git clone https://github.com/nightscout/cgm-remote-monitor.git && cd cgm-remote-monitor && npm install"
+
+#Systemd script
+cat > /etc/systemd/system/cgm.service <<'EOF'
+[Unit]
+Description=cgm remote monitor - nightscout
+After=network.target mongod.service
+
+[Service]
+Type=simple
+User=nightscout
+ExecStartPre=echo "Starting CGM remote monitor at `date`"
+WorkingDirectory=/home/nightscout/cgm-remote-monitor
+EnvironmentFile=/home/nightscout/cgm.env
+ExecStart=/usr/bin/node /home/nightscout/cgm-remote-monitor/server.js
+Restart=always
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=cgm-remote-monitor
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+#Environment Vars
+cat > /home/nightscout/cgm.env <<'EOF'
+MONGODB_URI=mongodb://127.0.0.1:27017/nightscout
+API_SECRET=CHANGEME
+MONGODB_COLLECTION=entries
+DISPLAY_UNITS=mmol
+PORT=1337
+SSL_KEY='/etc/pki/wildcard/*.YOUR.DOMAIN.com.key'
+SSL_CERT=/etc/pki/wildcard/fullchain.cer
+AUTH_DEFAULT_ROLES=denied
+THEME=colors
+ENABLE='food iob cob bwp basal bolus cors'
+DISABLE='simplealarms'
+SECURE_HSTS_HEADER=false
+LANG=en_AU.UTF-8
+HOSTNAME=cgm.YOUR.DOMAIN.com
+DBSIZE_MAX=10000
+DBSIZE_IN_MIB=true
+EOF
+
+#Update job
+cat > /home/nightscout/update-cgm.sh <<'EOF'
+#!/bin/bash
+#Simple script to update cgm code
+
+set -e
+
+LOG=/home/nightscout/cgm-update.log
+
+(
+    echo ""
+    echo "Updating cgm remote monitor at `date`"
+    echo "Stopping cgm-remote-monitor service..."
+    systemctl stop cgm
+    echo "Backing up existing code..."
+    rm -rf /home/nightscout/cgm-remote-monitor-backup
+    cp -a /home/nightscout/cgm-remote-monitor /home/nightscout/cgm-remote-monitor-backup
+    cd /home/nightscout/cgm-remote-monitor
+    echo "Pulling latest code from git"
+    git pull
+
+    echo "Removing old npm packages..."
+    rm -rf /home/nightscout/cgm-remote-monitor/node_modules
+    echo "Installing npm packages..."
+    /usr/bin/npm install --quiet --no-progress --production|| true
+    echo "Updating npm packages..."
+    /usr/bin/npm update --quiet --no-progress --production|| true
+    echo "Install security fixes for npm packages..."
+    /usr/bin/npm audit fix --quiet --no-progress --production|| true
+
+    echo "Starting cgm-remote-monitor service..."
+    systemctl start cgm
+    if `systemctl start cgm`; then
+        echo "Finished updating cgm remote monitor at `date`"
+    else
+        echo "Update failed, rolling back code and trying to restart"
+        rm -f /home/nightscout/cgm-remote-monitor
+        mv /home/nightscout/cgm-remote-monitor-backup /home/nightscout/cgm-remote-monitor
+        systemctl start cgm
+        echo "Rollback complete"
+    fi
+) 2>&1 >>$LOG
+EOF
+chmod +x /home/nightscout/update-cgm.sh
+(crontab -l 2>/dev/null; echo "#Update CGM
+30 9 * * 7 /home/nightscout/update-cgm.sh") | crontab -
+
+
+#Install nightscout reporter also
+cat > /home/nightscout/update-reporter.sh <<'EOF'
+#!/bin/bash
+#Simple script to download the latest nightscout reporter
+
+set -e
+
+rm -rf /tmp/nightscout-reporter_local.zip
+wget http://nightscout-reporter.zreptil.de/nightscout-reporter_local.zip -P /tmp/
+rm -rf /var/www/html
+mkdir -p /var/www/html
+chmod 755 /var/www/html
+chown root.root /var/www/html
+unzip /tmp/nightscout-reporter_local.zip -d /var/www/html/
+sed -i 's/nightscout-reporter.zreptil.de/cgm.YOUR.DOMAIN.com/g' /var/www/html/*.js*
+sed -i 's/nightscout-reporter.zreptil.de/cgm.YOUR.DOMAIN.com/g' /var/www/html/packages/nightscout_reporter/assets/*.js*
+sed -i 's/pdf.zreptil.de/cgm.YOUR.DOMAIN.com/g' /var/www/html/*.js*
+sed -i 's/pdf.zreptil.de/cgm.YOUR.DOMAIN.com/g' /var/www/html/packages/nightscout_reporter/assets/*.js*
+sed -i 's/nr.localhost/cgm.YOUR.DOMAIN.com/g' /var/www/html/*.js*
+sed -i 's/nr.localhost/cgm.YOUR.DOMAIN.com/g' /var/www/html/packages/nightscout_reporter/assets/*.js*
+restorecon -Rv /var/www/html
+
+service httpd restart
+EOF
+chmod +x /home/nightscout/update-reporter.sh
+(crontab -l 2>/dev/null; echo "#Update Reporter
+45 9 * * 7 /home/nightscout/update-reporter.sh") | crontab -
+
+/home/nightscout/update-reporter.sh
+
+#Add update cron to crontab
+(crontab -l 2>/dev/null; echo "#Weekly update job
+0 8 * * 7 /usr/bin/yum update -y >/dev/null || /bin/echo 'Weekly update job for `/usr/bin/hostname -s` FAILED'") | crontab -
+
+%end
